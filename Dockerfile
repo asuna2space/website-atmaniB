@@ -1,22 +1,29 @@
 # Official Playwright Python image based on Ubuntu Noble
-# Contains all pre-configured OS dependencies for Chromium headless
+# Contains pre-configured OS dependencies for headless Chromium
 FROM mcr.microsoft.com/playwright/python:v1.49.1-noble
 
-# Prevent python from buffering stdout/stderr and running in noninteractive mode
+# Prevent python from buffering stdout/stderr and noninteractive mode
 ENV PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    PORT=10000
 
 # Set working directory
 WORKDIR /app
 
-# Copy dependencies list
+# Copy dependencies list first for efficient Docker layer caching
 COPY requirements.txt .
 
-# Install python dependencies without cache to reduce image size
+# Install python dependencies without cache
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot script
-COPY bot.py .
+# Ensure Playwright Chromium browser and its system dependencies are completely downloaded
+RUN playwright install chromium --with-deps
+
+# Copy all application files (including bot.py and state.json if present)
+COPY . .
+
+# Expose Render web service port
+EXPOSE 10000
 
 # Default command to run the bot
 CMD ["python", "bot.py"]
