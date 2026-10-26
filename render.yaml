@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: google-meet-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: MEET_URL
+        sync: false
+      - key: STUDENT_NAME
+        value: طالب حاضر
+      - key: AUTO_REPLY_MESSAGE
+        value: عذراً أستاذ، المايك معطل لدي اليوم وأنا حاضر ومتابع معكم في الحصة.
+      - key: TRIGGER_KEYWORDS
+        value: طالب,حاضر,أستاذ
+      - key: AUTO_REPLY_COOLDOWN_SECONDS
+        value: "300"
+      - key: MAX_DURATION_MINUTES
+        value: "90"
+      - key: HEADLESS
+        value: "1"
+      - key: BROWSER_LOCALE
+        value: "ar"
