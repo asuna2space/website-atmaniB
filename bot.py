@@ -1,3 +1,4 @@
+import subprocess
 """
 Google Meet Headless Attendance & Auto-Reply Bot
 Optimized for ultra-low memory cloud containers (< 512MB RAM, Render Free Tier) & Local execution.
@@ -2278,7 +2279,7 @@ async def run_single_meeting_flow(browser, target_url: str, student_name: str):
                 break
 
             # Check if page or context was closed, and recreate cleanly
-            if page.is_closed() or (current_context_ref and current_context_ref.is_closed()):
+            if page.is_closed():
                 logger.warning("Target page was closed. Recreating fresh context and page...")
                 try:
                     storage_state_path = get_storage_state()
@@ -2504,7 +2505,15 @@ async def run_bot():
 
     async with async_playwright() as p:
         logger.info("Launching Chromium browser...")
-        browser = await p.chromium.launch(**launch_kwargs)
+        try:
+            browser = await p.chromium.launch(**launch_kwargs)
+        except Exception as e:
+            if "playwright install" in str(e) or "Executable doesn't exist" in str(e):
+                logger.warning("Chromium executable missing. Auto-installing via 'playwright install chromium'...")
+                subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+                browser = await p.chromium.launch(**launch_kwargs)
+            else:
+                raise e
         global_browser_ref = browser
 
         # Start Gmail Meet Link Watcher
