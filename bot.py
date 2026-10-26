@@ -2047,7 +2047,7 @@ async def monitor_chat_and_stay_alive(page: Page, student_name: str = "hazem"):
 
 async def check_gmail_for_meet_links(browser) -> tuple[bool, str, Optional[str]]:
     """
-    Checks the student's Gmail for incoming Google Meet links.
+    Checks the student's Gmail inbox for incoming Google Meet links.
     Returns: (success, message, new_link_or_None)
     """
     global bot_state
@@ -2103,8 +2103,8 @@ async def check_gmail_for_meet_links(browser) -> tuple[bool, str, Optional[str]]
         )
         gpage = await ctx.new_page()
         try:
-            await gpage.goto("https://mail.google.com/mail/u/0/#search/meet.google.com", wait_until="domcontentloaded", timeout=25000)
-            await asyncio.sleep(3)
+            # Navigate to Inbox directly (much faster and reliable)
+            await gpage.goto("https://mail.google.com/mail/u/0/#inbox", wait_until="domcontentloaded", timeout=25000)
 
             if "accounts.google.com" in gpage.url:
                 bot_state["google_account_info"] = "❌ كوكيز منتهية"
@@ -2112,15 +2112,37 @@ async def check_gmail_for_meet_links(browser) -> tuple[bool, str, Optional[str]]
             else:
                 bot_state["google_account_info"] = "✅ حساب المدرسة متصل ونشط"
 
+            # Wait for email rows to render
+            try:
+                await gpage.wait_for_selector("tr.zA", timeout=12000)
+            except Exception:
+                pass
+
+            meet_regex = re.compile(r"meet\.google\.com/([a-zA-Z]{3}-[a-zA-Z]{4}-[a-zA-Z]{3})")
+            rows = await gpage.locator("tr.zA").all()
+            
+            # Check the top 10 newest emails in the inbox
+            for row in rows[:10]:
+                try:
+                    txt = await row.inner_text()
+                    match = meet_regex.search(txt)
+                    if match:
+                        code = match.group(1).lower()
+                        found_url = f"https://meet.google.com/{code}"
+                        bot_state["gmail_last_detected_url"] = found_url
+                        return True, f"✅ تم رصد رابط Google Meet في البريد: {found_url}", found_url
+                except Exception:
+                    continue
+
+            # Fallback check entire content
             content = await gpage.content()
-            meet_regex = re.compile(r"https?://meet\.google\.com/([a-zA-Z]{3}-[a-zA-Z]{4}-[a-zA-Z]{3})")
             matches = meet_regex.findall(content)
             if matches:
-                first_code = matches[0]
-                found_url = f"https://meet.google.com/{first_code.lower()}"
+                found_url = f"https://meet.google.com/{matches[0].lower()}"
+                bot_state["gmail_last_detected_url"] = found_url
                 return True, f"✅ تم رصد رابط Google Meet في البريد: {found_url}", found_url
-            else:
-                return True, "✅ تم فحص البريد: لا توجد رسائل جديدة تحتوي على روابط Google Meet حالياً.", None
+
+            return True, "✅ تم فحص البريد: لا توجد رسائل جديدة تحتوي على روابط Google Meet حالياً.", None
         finally:
             await ctx.close()
     except Exception as ge:
@@ -2135,6 +2157,8 @@ async def gmail_monitor_loop(browser):
     logger.info("Starting Gmail Meet Link Watcher background loop...")
 
     seen_meet_links: Set[str] = set()
+    if MEET_URL:
+        seen_meet_links.add(MEET_URL.strip().lower())
 
     while True:
         await asyncio.sleep(30)  # Check every 30 seconds
@@ -2143,13 +2167,13 @@ async def gmail_monitor_loop(browser):
         if not bot_state.get("gmail_monitor_enabled", True):
             continue
 
-        # If currently inside a call, don't interrupt
+        # If currently inside an active call, don't interrupt
         if current_page_ref and not current_page_ref.is_closed():
-            continue
-
-        # If meeting is already starting or set
-        if MEET_URL:
-            continue
+            try:
+                if await is_in_call(current_page_ref):
+                    continue
+            except Exception:
+                pass
 
         storage_state_path = get_storage_state()
         if not storage_state_path or not os.path.exists(storage_state_path):
@@ -2157,8 +2181,8 @@ async def gmail_monitor_loop(browser):
 
         try:
             is_ok, msg, found_link = await check_gmail_for_meet_links(browser)
-            if found_link and found_link not in seen_meet_links:
-                seen_meet_links.add(found_link)
+            if found_link and found_link.lower() not in seen_meet_links:
+                seen_meet_links.add(found_link.lower())
                 bot_state["gmail_last_detected_url"] = found_link
                 logger.info(f"📧 [GMAIL WATCHER] Auto-joining meeting detected in Gmail: {found_link}")
 
