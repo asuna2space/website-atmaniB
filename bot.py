@@ -33,6 +33,28 @@ from email.header import decode_header
 from urllib.parse import parse_qs, urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Set, List, Optional
+import io
+import html
+
+# Audio & Speech Recognition Integration
+import warnings
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="pydub")
+try:
+    import imageio_ffmpeg
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+    if ffmpeg_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
+    import pydub
+    pydub.AudioSegment.converter = ffmpeg_exe
+    import speech_recognition as sr
+except Exception:
+    try:
+        import pydub
+        import speech_recognition as sr
+    except Exception:
+        pydub = None
+        sr = None
 
 try:
     import httpx
@@ -200,6 +222,65 @@ def format_cookies_for_playwright(raw_cookies: list) -> list:
         })
     return formatted
 
+def import_cookie_data_to_system(raw_str: str) -> tuple[bool, str]:
+    """
+    Parses and verifies raw cookies JSON or Base64 string,
+    standardizes them for Playwright, writes state.json, updates render_secret_base64.txt,
+    and updates os.environ["GOOGLE_STORAGE_STATE"] in memory.
+    """
+    global GOOGLE_STORAGE_STATE_RAW
+    try:
+        raw_str = raw_str.strip()
+        if not raw_str:
+            return False, "البيانات المدخلة فارغة"
+
+        if not raw_str.startswith("[") and not raw_str.startswith("{"):
+            try:
+                pad = (4 - (len(raw_str) % 4)) % 4
+                decoded_str = base64.b64decode(raw_str + "=" * pad).decode("utf-8")
+                parsed = json.loads(decoded_str)
+            except Exception:
+                parsed = json.loads(raw_str)
+        else:
+            parsed = json.loads(raw_str)
+
+        if isinstance(parsed, list):
+            state_dict = {"cookies": format_cookies_for_playwright(parsed), "origins": []}
+        elif isinstance(parsed, dict) and "cookies" in parsed:
+            state_dict = {
+                "cookies": format_cookies_for_playwright(parsed.get("cookies", [])),
+                "origins": parsed.get("origins", [])
+            }
+        else:
+            return False, "صيغة غير صالحة. يجب أن تكون قائمة كوكيز JSON أو كائن state.json"
+
+        cookie_count = len(state_dict.get("cookies", []))
+        if cookie_count == 0:
+            return False, "لم يتم العثور على أي كوكيز صالحة في البيانات"
+
+        # Save to state.json
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_dict, f, indent=2, ensure_ascii=False)
+
+        # Save Base64 file
+        try:
+            raw_compact = json.dumps(state_dict, separators=(",", ":"))
+            b64_val = base64.b64encode(raw_compact.encode("utf-8")).decode("utf-8")
+            with open(RENDER_TXT_FILE, "w", encoding="utf-8") as rf:
+                rf.write(b64_val)
+            os.environ["GOOGLE_STORAGE_STATE"] = b64_val
+            GOOGLE_STORAGE_STATE_RAW = b64_val
+        except Exception:
+            pass
+
+        bot_state["google_account_info"] = f"✅ تم حفظ {cookie_count} كوكيز لحساب المدرسة"
+        record_task("استيراد كوكيز Google", "success", f"✅ تم حفظ {cookie_count} كوكيز في state.json", "الحساب المدرسي جاهز للدخول بدون طلب إذن")
+        logger.info(f"Successfully imported and standardized {cookie_count} cookies!")
+        return True, f"تم حفظ واعتماد {cookie_count} كوكيز نشطة بنجاح."
+    except Exception as e:
+        logger.error(f"Failed to import cookie data: {e}")
+        return False, str(e)
+
 def load_telegram_subscriber() -> Optional[int | str]:
     """Loads previously saved subscriber chat ID from disk."""
     if os.path.exists(SUBSCRIBER_FILE):
@@ -299,25 +380,95 @@ def stop_current_meeting():
             pass
 
 # Telegram Async Integration
-async def send_telegram_message(chat_id: int | str, text: str) -> bool:
+def get_quick_attendance_markup() -> dict:
+    """Returns Telegram inline keyboard markup with quick attendance button."""
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "📢 إرسال: حاضر يا شيخ",
+                    "callback_data": "send_hadir_shaikh"
+                }
+            ]
+        ]
+    }
+
+def transcribe_voice_bytes(audio_bytes: bytes) -> tuple[bool, str]:
+    """
+    Converts in-memory Telegram voice note (OGG/Opus) to WAV via pydub,
+    then performs speech-to-text using SpeechRecognition in Arabic (ar-DZ / ar).
+    Returns (success: bool, text_or_error: str).
+    """
+    if not audio_bytes:
+        return False, "ملف الصوت فارغ."
+    if not pydub or not sr:
+        return False, "مكتبات معالجة الصوت غير متوفرة (SpeechRecognition / pydub)."
+
+    try:
+        # Load from in-memory stream
+        audio_stream = io.BytesIO(audio_bytes)
+        try:
+            segment = pydub.AudioSegment.from_file(audio_stream)
+        except Exception as p_err:
+            logger.error(f"pydub failed to decode audio bytes: {p_err}")
+            return False, f"فشل فك تشفير الصوت: {p_err}"
+
+        # Export as WAV in memory
+        wav_stream = io.BytesIO()
+        segment.export(wav_stream, format="wav")
+        wav_stream.seek(0)
+
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_stream) as source:
+            audio_data = recognizer.record(source)
+
+        text = ""
+        # Try Algerian Arabic first, then standard Arabic
+        for lang in ("ar-DZ", "ar-SA", "ar"):
+            try:
+                text = recognizer.recognize_google(audio_data, language=lang)
+                if text and text.strip():
+                    break
+            except sr.UnknownValueError:
+                continue
+            except Exception as lang_err:
+                logger.warning(f"Speech recognition attempt with {lang} failed: {lang_err}")
+                continue
+
+        if not text or not text.strip():
+            return False, "لم يتمكن محرك التعرف على الصوت من استخراج الكلمات (قد يكون الصوت منخفضاً أو غير واضح)."
+
+        return True, text.strip()
+    except Exception as e:
+        logger.error(f"transcribe_voice_bytes unexpected error: {e}")
+        return False, f"حدث خطأ أثناء معالجة الصوت: {e}"
+
+async def send_telegram_message(chat_id: int | str, text: str, reply_markup: Optional[dict] = None) -> bool:
     """Sends a formatted text message to Telegram with fallback to plain text if HTML parsing fails."""
     if not TELEGRAM_BOT_TOKEN or not httpx:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
         async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+            resp = await client.post(url, json=payload)
             if resp.status_code == 200:
                 return True
             logger.warning(f"Telegram sendMessage failed ({resp.status_code}): {resp.text}. Retrying with plain text...")
             plain_text = re.sub(r'<[^>]+>', '', text)
-            resp2 = await client.post(url, json={"chat_id": chat_id, "text": plain_text})
+            payload_plain = {"chat_id": chat_id, "text": plain_text}
+            if reply_markup:
+                payload_plain["reply_markup"] = reply_markup
+            resp2 = await client.post(url, json=payload_plain)
             return resp2.status_code == 200
     except Exception as e:
         logger.warning(f"Telegram sendMessage error: {e}")
         return False
 
-async def send_telegram_photo(chat_id: int | str, photo_bytes: bytes, caption: str = "") -> bool:
+
+async def send_telegram_photo(chat_id: int | str, photo_bytes: bytes, caption: str = "", reply_markup: Optional[dict] = None) -> bool:
     """Sends a photo with caption to Telegram with fallback to plain text if HTML parsing fails."""
     if not TELEGRAM_BOT_TOKEN or not photo_bytes or not httpx:
         return False
@@ -326,6 +477,8 @@ async def send_telegram_photo(chat_id: int | str, photo_bytes: bytes, caption: s
         async with httpx.AsyncClient(timeout=35) as client:
             files = {"photo": ("screenshot.png", photo_bytes, "image/png")}
             data = {"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"}
+            if reply_markup:
+                data["reply_markup"] = json.dumps(reply_markup)
             resp = await client.post(url, data=data, files=files)
             if resp.status_code == 200:
                 return True
@@ -431,17 +584,184 @@ async def telegram_polling_loop():
                     data = resp.json()
                     for update in data.get("result", []):
                         offset = update["update_id"] + 1
+
+                        # 1. Handle Inline Button Clicks (Callback Query)
+                        cb = update.get("callback_query")
+                        if cb:
+                            cb_id = cb.get("id")
+                            cb_msg = cb.get("message") or {}
+                            cb_chat_id = cb_msg.get("chat", {}).get("id")
+                            cb_data = cb.get("data", "")
+
+                            # Acknowledge callback query
+                            try:
+                                await client.post(
+                                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery",
+                                    json={"callback_query_id": cb_id}
+                                )
+                            except Exception:
+                                pass
+
+                            if cb_data == "send_hadir_shaikh":
+                                attendance_text = "حاضر يا شيخ"
+                                if current_page_ref and not current_page_ref.is_closed():
+                                    ok = await inject_meet_chat_message(current_page_ref, attendance_text)
+                                    if ok:
+                                        await send_telegram_message(
+                                            cb_chat_id,
+                                            f"📢 ✅ <b>تم إرسال التحضير بنجاح:</b>\n\n<i>\"{attendance_text}\"</i>\n\nإلى شات Google Meet!",
+                                            reply_markup=get_quick_attendance_markup()
+                                        )
+                                    else:
+                                        await send_telegram_message(
+                                            cb_chat_id,
+                                            "❌ <b>تعذر إرسال التحضير:</b> تأكد من أن شات الحصة متاح وغير مقفل.",
+                                            reply_markup=get_quick_attendance_markup()
+                                        )
+                                else:
+                                    await send_telegram_message(
+                                        cb_chat_id,
+                                        "⚠️ <b>لا يوجد اجتماع Google Meet نشط حالياً لإرسال التحضير إليه.</b>",
+                                        reply_markup=get_quick_attendance_markup()
+                                    )
+                            continue
+
+                        # 2. Extract Message Details
                         message = update.get("message") or update.get("edited_message")
                         if not message:
                             continue
                         chat_id = message["chat"]["id"]
                         text = (message.get("text") or "").strip()
+                        doc = message.get("document")
+                        voice = message.get("voice") or message.get("audio")
 
-                        if not text:
+                        if not text and not doc and not voice:
+                            continue
+
+                        # Check Admin status
+                        sub_id = telegram_subscriber_chat_id or load_telegram_subscriber()
+                        is_admin = False
+                        if sub_id and str(chat_id) == str(sub_id):
+                            is_admin = True
+                        elif str(chat_id) == "8760969567":
+                            is_admin = True
+                            save_telegram_subscriber(chat_id)
+
+                        # Handle Voice Notes (Voice to Text & Meet Chat Injection)
+                        if voice:
+                            if not is_admin:
+                                await send_telegram_message(chat_id, "🔒 هذه الميزة مخصصة للآدمن فقط. أرسل كلمة المرور 1212 أولاً للتوثيق.")
+                                continue
+
+                            file_id = voice.get("file_id")
+                            duration = voice.get("duration", 0)
+                            await send_telegram_message(chat_id, "🎙️ ⏳ <b>جاري استلام الملاحظة الصوتية وتفريغها...</b>")
+
+                            try:
+                                f_resp = await client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}")
+                                if f_resp.status_code == 200:
+                                    f_path = f_resp.json().get("result", {}).get("file_path")
+                                    if f_path:
+                                        down_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{f_path}"
+                                        audio_resp = await client.get(down_url)
+                                        if audio_resp.status_code == 200:
+                                            raw_audio = audio_resp.content
+                                            ok, text_result = transcribe_voice_bytes(raw_audio)
+                                            if ok:
+                                                if current_page_ref and not current_page_ref.is_closed():
+                                                    sent_ok = await inject_meet_chat_message(current_page_ref, text_result)
+                                                    if sent_ok:
+                                                        await send_telegram_message(
+                                                            chat_id,
+                                                            f"🎙️ ✅ <b>تم تفريغ الصوت وإرساله لشات Meet بنجاح!</b>\n\n"
+                                                            f"📝 <b>النص المستخرج:</b> <i>\"{html.escape(text_result)}\"</i>\n"
+                                                            f"⏱️ <b>المدة:</b> {duration} ثانية\n"
+                                                            f"💬 تم حقن النص في شات الحصة فوراً.",
+                                                            reply_markup=get_quick_attendance_markup()
+                                                        )
+                                                    else:
+                                                        await send_telegram_message(
+                                                            chat_id,
+                                                            f"🎙️ ⚠️ <b>تم تفريغ الصوت بنجاح ولكن تعذر إرساله لشات Meet:</b>\n\n"
+                                                            f"📝 <b>النص المستخرج:</b> <i>\"{html.escape(text_result)}\"</i>\n"
+                                                            f"تأكد من فتح شات الحصة وأن الاجتماع نشط.",
+                                                            reply_markup=get_quick_attendance_markup()
+                                                        )
+                                                else:
+                                                    await send_telegram_message(
+                                                        chat_id,
+                                                        f"🎙️ <b>تم تفريغ الصوت بنجاح (لا يوجد اجتماع Meet نشط):</b>\n\n"
+                                                        f"📝 <b>النص المستخرج:</b> <i>\"{html.escape(text_result)}\"</i>\n\n"
+                                                        f"⚠️ أرسل رابط الاجتماع أولاً للانضمام إليه.",
+                                                        reply_markup=get_quick_attendance_markup()
+                                                    )
+                                            else:
+                                                await send_telegram_message(
+                                                    chat_id,
+                                                    f"⚠️ <b>تعذر تفريغ الصوت:</b> {text_result}",
+                                                    reply_markup=get_quick_attendance_markup()
+                                                )
+                                        else:
+                                            await send_telegram_message(chat_id, "❌ تعذر تحميل ملف الصوت من خوادم تيليجرام.")
+                                    else:
+                                        await send_telegram_message(chat_id, "❌ لم يتم العثور على مسار ملف الصوت.")
+                                else:
+                                    await send_telegram_message(chat_id, "❌ تعذر جلب معلومات ملف الصوت.")
+                            except Exception as ve:
+                                logger.error(f"Voice note handling error: {ve}")
+                                await send_telegram_message(chat_id, f"⚠️ حدث خطأ أثناء معالجة الصوت: {ve}")
                             continue
 
                         # Always save this chat as the verified subscriber
                         save_telegram_subscriber(chat_id)
+
+                        # Handle uploaded cookie/session files (state.json or render_secret_base64.txt)
+                        if doc:
+                            file_id = doc.get("file_id")
+                            file_name = (doc.get("file_name") or "").lower()
+                            if file_id and any(ext in file_name for ext in (".json", ".txt", "state", "cookie", "base64", "render")):
+                                try:
+                                    f_resp = await client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile?file_id={file_id}")
+                                    if f_resp.status_code == 200:
+                                        f_path = f_resp.json().get("result", {}).get("file_path")
+                                        if f_path:
+                                            down_resp = await client.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{f_path}")
+                                            if down_resp.status_code == 200:
+                                                content_str = down_resp.text.strip()
+                                                ok, res_msg = import_cookie_data_to_system(content_str)
+                                                if ok:
+                                                    await send_telegram_message(
+                                                        chat_id,
+                                                        f"🎉 <b>تم تحديث كوكيز حساب Google في Render بنجاح!</b>\n\n"
+                                                        f"📄 <b>الملف:</b> <code>{doc.get('file_name', 'state file')}</code>\n"
+                                                        f"🍪 {res_msg}\n\n"
+                                                        f"✅ <b>البوت متصل بحساب المدرسة وجاهز للدخول فوراً بدون طلب إذن!</b>"
+                                                    )
+                                                else:
+                                                    await send_telegram_message(chat_id, f"❌ <b>فشل معالجة ملف الكوكيز:</b> {res_msg}")
+                                                continue
+                                except Exception as de:
+                                    logger.error(f"Error handling Telegram document: {de}")
+                                    await send_telegram_message(chat_id, f"⚠️ حدث خطأ أثناء تحميل الملف: {de}")
+                                    continue
+
+                        # Handle text containing Base64 / Cookie JSON or /cookies command
+                        raw_candidate = ""
+                        if text.startswith("/cookies ") or text.startswith("/cookie "):
+                            raw_candidate = text.split(" ", 1)[1].strip()
+                        elif len(text) > 120 and (text.startswith("eyJ") or text.startswith("[") or text.startswith("{")):
+                            raw_candidate = text.strip()
+
+                        if raw_candidate:
+                            ok, res_msg = import_cookie_data_to_system(raw_candidate)
+                            if ok:
+                                await send_telegram_message(
+                                    chat_id,
+                                    f"🎉 <b>تم تحديث كوكيز حساب Google في Render بنجاح!</b>\n\n"
+                                    f"🍪 {res_msg}\n\n"
+                                    f"✅ <b>البوت متصل بحساب المدرسة وجاهز للدخول فوراً بدون طلب إذن!</b>"
+                                )
+                                continue
 
                         # Password authentication (1212)
                         if "1212" in text or text in ("/login", "hazem 1212"):
@@ -472,7 +792,7 @@ async def telegram_polling_loop():
                                 "▫️ /test - تجربة استقبال صورة للتأكد من الاتصال\n"
                                 "▫️ /stop - إنهاء المكالمة ومغادرة الاجتماع"
                             )
-                            await send_telegram_message(chat_id, welcome)
+                            await send_telegram_message(chat_id, welcome, reply_markup=get_quick_attendance_markup())
                             continue
 
                         # Command: /gmail
@@ -501,7 +821,7 @@ async def telegram_polling_loop():
                                 f"📊 <b>التشخيص:</b> {bot_state.get('problem_diagnosis')}\n"
                                 f"📸 <b>إرسال دوري كل 5 دقائق:</b> مفعل ومربوط بحسابك"
                             )
-                            await send_telegram_message(chat_id, status_msg)
+                            await send_telegram_message(chat_id, status_msg, reply_markup=get_quick_attendance_markup())
                             continue
 
                         # Command: /screenshot or /test
@@ -553,10 +873,62 @@ async def telegram_polling_loop():
 
                             # Trigger meeting
                             start_or_restart_meeting(found_url, "hazem")
+                        # Quick Attendance commands
+                        elif text in ("/hadir", "/shaikh", "/present", "حاضر", "حاضر يا شيخ"):
+                            attendance_text = "حاضر يا شيخ"
+                            if current_page_ref and not current_page_ref.is_closed():
+                                ok = await inject_meet_chat_message(current_page_ref, attendance_text)
+                                if ok:
+                                    await send_telegram_message(
+                                        chat_id,
+                                        f"📢 ✅ <b>تم إرسال التحضير بنجاح:</b>\n\n<i>\"{attendance_text}\"</i>\n\nإلى شات Google Meet!",
+                                        reply_markup=get_quick_attendance_markup()
+                                    )
+                                else:
+                                    await send_telegram_message(
+                                        chat_id,
+                                        "❌ <b>تعذر إرسال التحضير:</b> تأكد من أن شات الحصة متاح وغير مقفل.",
+                                        reply_markup=get_quick_attendance_markup()
+                                    )
+                            else:
+                                await send_telegram_message(
+                                    chat_id,
+                                    "⚠️ <b>لا يوجد اجتماع Google Meet نشط حالياً لإرسال التحضير إليه.</b>",
+                                    reply_markup=get_quick_attendance_markup()
+                                )
+                            continue
+
+                        # Regular text message from admin -> Relay directly to Google Meet Chat!
+                        elif is_admin and not text.startswith("/"):
+                            if current_page_ref and not current_page_ref.is_closed():
+                                ok = await inject_meet_chat_message(current_page_ref, text)
+                                if ok:
+                                    await send_telegram_message(
+                                        chat_id,
+                                        f"💬 ✅ <b>تم إرسال رسالتك إلى شات Google Meet بنجاح!</b>\n\n"
+                                        f"📝 <b>النص:</b> <i>\"{html.escape(text)}\"</i>",
+                                        reply_markup=get_quick_attendance_markup()
+                                    )
+                                else:
+                                    await send_telegram_message(
+                                        chat_id,
+                                        "❌ <b>تعذر إرسال الرسالة إلى شات Meet:</b> تأكد من أن شات الحصة متاح وغير مقفل.",
+                                        reply_markup=get_quick_attendance_markup()
+                                    )
+                            else:
+                                await send_telegram_message(
+                                    chat_id,
+                                    f"⚠️ <b>لا يوجد اجتماع Google Meet نشط حالياً لنقل الرسالة إليه.</b>\n\n"
+                                    f"أرسل رابط الاجتماع أولاً للانضمام إليه، أو أرسل <code>/status</code> لمعرفة الحالة.",
+                                    reply_markup=get_quick_attendance_markup()
+                                )
+                            continue
+
                         else:
                             await send_telegram_message(
                                 chat_id, 
-                                "❓ لم أتعرف على الأمر.\n- أرسل رابط Google Meet للانضمام فوراً.\n- أو أرسل كلمة المرور 1212 للتوثيق.\n- أو أرسل /screenshot للحصول على صورة شاشة."
+                                "❓ لم أتعرف على الأمر.\n- أرسل رابط Google Meet للانضمام فوراً.\n- أو أرسل كلمة المرور 1212 للتوثيق.\n- أو أرسل رسالة نصية أو فويس ليتم حقنه في شات Meet مباشرة!",
+                                reply_markup=get_quick_attendance_markup()
                             )
             except Exception as e:
                 logger.warning(f"Telegram polling exception: {e}")
@@ -1976,17 +2348,20 @@ async def wait_until_admitted(page: Page, timeout_seconds: int = 1800) -> bool:
 
 async def open_chat_panel(page: Page) -> bool:
     """Clicks the chat icon inside the meeting room to open the chat panel."""
+    if not page or page.is_closed():
+        return False
     chat_selectors = [
-        'button[aria-label*="chat" i]',
-        'button[aria-label*="الدردشة" i]',
+        'button[aria-label*="المحادثة" i]',
+        'button[aria-label*="Chat" i]',
         'button[data-panel-id="2"]',
+        'button[aria-label*="الدردشة" i]',
         'button[aria-label*="إرسال رسالة" i]',
         'button[jsname="A5il2e"]'
     ]
     for sel in chat_selectors:
         try:
             btn = page.locator(sel).first
-            if await btn.is_visible(timeout=1000):
+            if await btn.is_visible(timeout=800):
                 await btn.click()
                 logger.info(f"Clicked chat icon using selector: {sel}")
                 await asyncio.sleep(0.5)
@@ -1995,27 +2370,104 @@ async def open_chat_panel(page: Page) -> bool:
             continue
     return False
 
-async def send_chat_message(page: Page, message: str) -> bool:
-    """Types and sends a message in the Google Meet chat box."""
+async def inject_meet_chat_message(page: Page, message_text: str) -> bool:
+    """
+    Injects and sends a message into the active Google Meet chat panel.
+    - Checks if chat input textarea is already visible.
+    - If not visible, clicks the chat toggle button:
+      (button[aria-label*="المحادثة"], button[aria-label*="Chat"], button[data-panel-id="2"]).
+    - Waits for the input textarea:
+      (textarea[aria-label*="إرسال رسالة"], textarea[aria-label*="Send a message"]).
+    - Types message and presses Enter.
+    - Fully resilient error handling (try/except) without breaking the active session.
+    """
+    if not page or page.is_closed():
+        logger.warning("inject_meet_chat_message: Page reference is closed or None.")
+        return False
+
+    message_text = (message_text or "").strip()
+    if not message_text:
+        return False
+
+    logger.info(f"Injecting message into Google Meet chat: '{message_text}'")
+
     input_selectors = [
-        'textarea[aria-label*="Send a message" i]',
         'textarea[aria-label*="إرسال رسالة" i]',
+        'textarea[aria-label*="Send a message" i]',
+        'textarea[aria-label*="المحادثة" i]',
         'textarea[aria-label*="chat" i]',
         'textarea[name="chatTextInput"]',
         'textarea'
     ]
-    for sel in input_selectors:
+
+    try:
+        # Step 1: Check if input textarea is already open and visible
+        input_box = None
+        for sel in input_selectors:
+            try:
+                locator = page.locator(sel).first
+                if await locator.is_visible(timeout=800):
+                    input_box = locator
+                    break
+            except Exception:
+                continue
+
+        # Step 2: If not visible, open chat panel using appropriate selectors
+        if not input_box:
+            logger.info("Chat textarea not visible. Attempting to open chat panel...")
+            await open_chat_panel(page)
+
+            # Wait for textarea to appear
+            for sel in input_selectors:
+                try:
+                    locator = page.locator(sel).first
+                    if await locator.is_visible(timeout=3000):
+                        input_box = locator
+                        break
+                except Exception:
+                    continue
+
+        if not input_box:
+            logger.warning("inject_meet_chat_message: Could not locate chat input textarea.")
+            return False
+
+        # Step 3: Type message and press Enter
+        await input_box.click()
+        await input_box.fill(message_text)
+        await asyncio.sleep(0.3)
+        await input_box.press("Enter")
+        await asyncio.sleep(0.3)
+
+        # Fallback: check if send button is needed if textarea still contains text
         try:
-            box = page.locator(sel).first
-            if await box.is_visible(timeout=2000):
-                await box.fill(message)
-                await asyncio.sleep(0.3)
-                await box.press("Enter")
-                logger.info(f"Auto-reply sent: '{message}'")
-                return True
+            val = await input_box.input_value()
+            if val and val.strip():
+                send_buttons = [
+                    'button[aria-label*="إرسال" i]',
+                    'button[aria-label*="Send" i]',
+                    'button[jsname="m9Zdn"]'
+                ]
+                for s_sel in send_buttons:
+                    s_btn = page.locator(s_sel).first
+                    if await s_btn.is_visible(timeout=500):
+                        await s_btn.click()
+                        await asyncio.sleep(0.3)
+                        break
         except Exception:
-            continue
-    return False
+            pass
+
+        logger.info(f"✅ Successfully injected message into Meet chat: '{message_text}'")
+        record_task("حقن رسالة في شات Meet", "success", f"تم إرسال: {message_text[:35]}...", "تم حقن الرسالة في شات الحصة بنجاح")
+        return True
+
+    except Exception as e:
+        logger.error(f"Exception during Meet chat injection: {e}")
+        record_task("حقن رسالة في شات Meet", "warning", f"فشل الحقن: {e}", "تعذر إرسال الرسالة إلى شات الحصة")
+        return False
+
+async def send_chat_message(page: Page, message: str) -> bool:
+    """Compatibility wrapper delegating to inject_meet_chat_message."""
+    return await inject_meet_chat_message(page, message)
 
 async def monitor_chat_and_stay_alive(page: Page, student_name: str = "hazem"):
     """
@@ -2079,9 +2531,10 @@ async def monitor_chat_and_stay_alive(page: Page, student_name: str = "hazem"):
                 f"👤 <b>اسم الطالب:</b> {student_name}\n"
                 f"🔗 <b>الرابط:</b> {bot_state.get('meet_url')}\n"
                 f"⏱️ <b>وقت الدخول:</b> {time.strftime('%H:%M:%S')}\n\n"
-                "📸 <i>سأرسل لك لقطة شاشة كل 5 دقائق لمتابعة حضورك تلقائياً.</i>"
+                "📸 <i>سأرسل لك لقطة شاشة كل 5 دقائق لمتابعة حضورك تلقائياً.</i>\n\n"
+                "💬 <b>ميزة التفاعل:</b> اكتب أي رسالة أو أرسل فويس صوتي ليتم حقنه في شات الحصة فوراً، أو اضغط الزر أدناه لإرسال التحضير:"
             )
-            await send_telegram_photo(telegram_subscriber_chat_id, first_shot, caption)
+            await send_telegram_photo(telegram_subscriber_chat_id, first_shot, caption, reply_markup=get_quick_attendance_markup())
             logger.info(f"Sent initial entry screenshot to Telegram chat {telegram_subscriber_chat_id}")
         except Exception as te:
             logger.warning(f"Failed to send initial Telegram screenshot: {te}")
@@ -2320,16 +2773,63 @@ async def gmail_monitor_loop(browser):
             logger.debug(f"Error in gmail_monitor_loop: {e}")
 
 def get_storage_state() -> Optional[str]:
-    """Finds or decodes Google authentication state if present."""
+    """
+    Finds or decodes Google authentication state.
+    PRIORITY FOR RENDER & CLOUD:
+    1. GOOGLE_STORAGE_STATE environment variable (Render Dashboard):
+       Checks and compares cookies. If identical, does not overwrite. If different/newer, updates state.json immediately.
+    2. Local state.json file (Local execution).
+    3. Local cookies.json file (Cookie-Editor raw export).
+    """
+    # 1. Check Render / Cloud environment variable first!
+    env_state = os.getenv("GOOGLE_STORAGE_STATE", "").strip() or GOOGLE_STORAGE_STATE_RAW
+    if env_state:
+        try:
+            decoded = env_state
+            if not decoded.startswith("{") and not decoded.startswith("["):
+                decoded = base64.b64decode(env_state).decode("utf-8")
+            data = json.loads(decoded)
+            if isinstance(data, list):
+                new_state = {"cookies": format_cookies_for_playwright(data), "origins": []}
+            elif isinstance(data, dict):
+                new_state = {
+                    "cookies": format_cookies_for_playwright(data.get("cookies", [])),
+                    "origins": data.get("origins", [])
+                }
+            else:
+                new_state = data
+
+            # Smart check: compare with existing state.json
+            need_write = True
+            if os.path.exists(STATE_FILE):
+                try:
+                    with open(STATE_FILE, "r", encoding="utf-8") as f:
+                        curr_file_data = json.load(f)
+                    curr_cookies = {c["name"]: c["value"] for c in curr_file_data.get("cookies", []) if isinstance(c, dict) and "name" in c}
+                    new_cookies = {c["name"]: c["value"] for c in new_state.get("cookies", []) if isinstance(c, dict) and "name" in c}
+                    if curr_cookies == new_cookies and len(curr_cookies) > 0:
+                        need_write = False
+                        logger.info("Render GOOGLE_STORAGE_STATE matches state.json. Using active session without overwrite.")
+                except Exception:
+                    need_write = True
+
+            if need_write:
+                with open(STATE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(new_state, f, indent=2)
+                logger.info("Detected NEW/UPDATED session in Render GOOGLE_STORAGE_STATE! Updated state.json successfully.")
+
+            return STATE_FILE
+        except Exception as e:
+            logger.warning(f"Failed to parse GOOGLE_STORAGE_STATE from environment: {e}")
+
+    # 2. Local state.json fallback
     if os.path.exists(STATE_FILE):
-        # Auto-sanitize cookies in state.json to ensure Chromium doesn't drop SID/HSID
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 state_data = json.load(f)
             if isinstance(state_data, dict) and "cookies" in state_data:
                 orig_cookies = state_data.get("cookies", [])
                 sanitized = format_cookies_for_playwright(orig_cookies)
-                # Check if any sameSite=None had secure=False
                 needs_update = False
                 for c in orig_cookies:
                     if str(c.get("sameSite", "")).lower() in ("none", "no_restriction") and not c.get("secure", False):
@@ -2344,6 +2844,7 @@ def get_storage_state() -> Optional[str]:
             pass
         return STATE_FILE
 
+    # 3. Local cookies.json fallback
     if os.path.exists(COOKIES_FILE):
         try:
             with open(COOKIES_FILE, "r", encoding="utf-8") as f:
@@ -2363,28 +2864,6 @@ def get_storage_state() -> Optional[str]:
             return STATE_FILE
         except Exception as e:
             logger.warning(f"Failed to convert cookies.json: {e}")
-
-    if GOOGLE_STORAGE_STATE_RAW:
-        try:
-            decoded = GOOGLE_STORAGE_STATE_RAW
-            if not decoded.startswith("{") and not decoded.startswith("["):
-                decoded = base64.b64decode(GOOGLE_STORAGE_STATE_RAW).decode("utf-8")
-            data = json.loads(decoded)
-            if isinstance(data, list):
-                state_data = {"cookies": format_cookies_for_playwright(data), "origins": []}
-            elif isinstance(data, dict):
-                state_data = {
-                    "cookies": format_cookies_for_playwright(data.get("cookies", [])),
-                    "origins": data.get("origins", [])
-                }
-            else:
-                state_data = data
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(state_data, f, indent=2)
-            logger.info("Loaded and formatted Google session from GOOGLE_STORAGE_STATE environment variable!")
-            return STATE_FILE
-        except Exception as e:
-            logger.warning(f"Failed to parse GOOGLE_STORAGE_STATE: {e}")
 
     return None
 
