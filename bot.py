@@ -30,7 +30,7 @@ import hashlib
 import imaplib
 import email
 from email.header import decode_header
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Set, List, Optional
 
@@ -67,8 +67,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MeetBot")
 
+def clean_meet_url(raw_url: str) -> str:
+    """
+    Cleans and standardizes Google Meet URLs:
+    - Extracts standard meeting code (e.g. xxx-yyyy-zzz or lookup/xxx)
+    - Strips /meet/ prefix
+    - Strips all toxic query params (?authuser=..., ?pli=..., ?hs=...) which cause
+      Google to redirect or fail when account indices don't match the bot's session.
+    """
+    if not raw_url:
+        return ""
+    text = raw_url.strip()
+    # 1. Standard 3-4-3 or 3-3-3 meeting code pattern
+    m = re.search(r'([a-zA-Z]{3}-[a-zA-Z]{3,4}-[a-zA-Z]{3})', text)
+    if m:
+        return f"https://meet.google.com/{m.group(1).lower()}"
+    # 2. lookup/xyz pattern
+    m_lookup = re.search(r'meet\.google\.com/lookup/([a-zA-Z0-9_-]+)', text, re.IGNORECASE)
+    if m_lookup:
+        return f"https://meet.google.com/lookup/{m_lookup.group(1)}"
+    # 3. General meet url cleanup
+    try:
+        t = text if text.startswith("http") else "https://" + text
+        parsed = urlparse(t)
+        if "meet.google.com" in parsed.netloc:
+            path = parsed.path.strip("/")
+            if path.startswith("meet/"):
+                path = path[5:]
+            return f"https://meet.google.com/{path}"
+    except Exception:
+        pass
+    return text
+
 # Environment & Settings
-MEET_URL = os.getenv("MEET_URL", "").strip()
+MEET_URL = clean_meet_url(os.getenv("MEET_URL", "").strip())
 STUDENT_NAME = os.getenv("STUDENT_NAME", "hazem").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8971961233:AAGCdv5ODVakOx0Js5dd8DHQS1u7HjOQh-4").strip()
 
@@ -237,6 +269,7 @@ def record_task(step: str, status: str, summary: str, details: str = "", problem
 def start_or_restart_meeting(url: str, student_name: str = "hazem"):
     """Triggers starting or restarting a meeting with a new URL."""
     global MEET_URL, STUDENT_NAME, stop_requested, current_page_ref, new_meeting_event
+    url = clean_meet_url(url)
     MEET_URL = url
     STUDENT_NAME = student_name
     bot_state["meet_url"] = url
@@ -379,7 +412,7 @@ async def telegram_polling_loop():
 
     logger.info("Starting Telegram Bot listener for @meethazem_bot...")
     offset = 0
-    meet_regex = re.compile(r"(https?://meet\.google\.com/[a-zA-Z0-9_-]+|meet\.google\.com/[a-zA-Z0-9_-]+)")
+    meet_regex = re.compile(r"(?:https?://)?meet\.google\.com/[a-zA-Z0-9_\-\?=&/]+|[a-zA-Z]{3}-[a-zA-Z]{3,4}-[a-zA-Z]{3}")
 
     async with httpx.AsyncClient(timeout=35) as client:
         while True:
@@ -502,7 +535,7 @@ async def telegram_polling_loop():
                         # Detect Google Meet link in text
                         match = meet_regex.search(text)
                         if match:
-                            found_url = match.group(0)
+                            found_url = clean_meet_url(match.group(0))
                             if not found_url.startswith("http"):
                                 found_url = "https://" + found_url
 
@@ -768,7 +801,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             post_body = self.rfile.read(content_len).decode("utf-8")
             try:
                 data = json.loads(post_body)
-                new_url = data.get("meet_url", "").strip()
+                new_url = clean_meet_url(data.get("meet_url", "").strip())
                 new_name = data.get("student_name", "").strip() or "hazem"
                 if not new_url:
                     self.send_response(400)
@@ -1590,6 +1623,14 @@ async def fast_dismiss_and_mute(page: Page, student_name: str = "hazem"):
     except Exception:
         pass
 
+    # Ensure camera and mic are toggled off via hotkeys
+    try:
+        await page.keyboard.press("Control+e")
+        await asyncio.sleep(0.2)
+        await page.keyboard.press("Control+d")
+    except Exception:
+        pass
+
     # 2. Enter guest name if input field is present
     try:
         name_input = page.locator('input[type="text"][placeholder*="اسم" i], input[type="text"][placeholder*="name" i]').first
@@ -1685,16 +1726,28 @@ async def click_join_button(page: Page) -> tuple[bool, str]:
 
         # 3. Locate primary Join button
         btn = page.locator(
+            'button[jsname="Qx7uuf"], '
+            '[role="button"][jsname="Qx7uuf"], '
+            'button[jsname="b0t70b"], '
+            '[role="button"][jsname="b0t70b"], '
             'button:has-text("Participer à la réunion"), '
+            'button:has-text("Demander à participer"), '
+            'button:has-text("Rejoindre"), '
             'button:has-text("انضم الآن"), '
             'button:has-text("الانضمام الآن"), '
             'button:has-text("Join now"), '
-            'button:has-text("Demander à participer"), '
             'button:has-text("Ask to join"), '
             'button:has-text("Switch here"), '
             'button:has-text("التبديل إلى هنا"), '
             'button:has-text("Join here too"), '
-            'button:has-text("طلب الانضمام")'
+            'button:has-text("طلب الانضمام"), '
+            '[role="button"]:has-text("انضم الآن"), '
+            '[role="button"]:has-text("الانضمام الآن"), '
+            '[role="button"]:has-text("طلب الانضمام"), '
+            '[role="button"]:has-text("Join now"), '
+            '[role="button"]:has-text("Ask to join"), '
+            '[role="button"]:has-text("Switch here"), '
+            '[role="button"]:has-text("التبديل إلى هنا")'
         ).first
         try:
             if await btn.is_visible(timeout=600):
@@ -1705,6 +1758,33 @@ async def click_join_button(page: Page) -> tuple[bool, str]:
                     await btn.evaluate("el => el.click()")
                 logger.info(f"Successfully clicked join button: '{txt}'")
                 return True, txt
+        except Exception:
+            pass
+
+        # 3b. JavaScript DOM Fallback to click any visible join button
+        try:
+            clicked_txt = await page.evaluate('''() => {
+                const keywords = [
+                    "انضم الآن", "الانضمام الآن", "طلب الانضمام", "انضمام",
+                    "Join now", "Ask to join", "Switch here", "Join here too",
+                    "Participer à la réunion", "Demander à participer", "Rejoindre"
+                ];
+                const elements = Array.from(document.querySelectorAll('button, [role="button"], div[jsname="Qx7uuf"], button[jsname="Qx7uuf"]'));
+                for (const el of elements) {
+                    if (el.offsetParent === null) continue;
+                    const text = (el.innerText || el.getAttribute("aria-label") || "").trim();
+                    for (const kw of keywords) {
+                        if (text.toLowerCase().includes(kw.toLowerCase())) {
+                            el.click();
+                            return text;
+                        }
+                    }
+                }
+                return null;
+            }''')
+            if clicked_txt:
+                logger.info(f"Successfully clicked join button via JS evaluator: '{clicked_txt}'")
+                return True, clicked_txt
         except Exception:
             pass
 
@@ -1728,6 +1808,15 @@ async def diagnose_post_click_state(page: Page) -> dict:
         "url": page.url,
         "title": await page.title()
     }
+
+    # 0. Check if redirected out of meeting
+    curr_u = page.url.lower()
+    if "workspace.google.com" in curr_u or curr_u.rstrip("/").endswith("meet.google.com"):
+        result["status"] = "error"
+        result["problem_type"] = "DENIED_OR_ENDED"
+        result["summary"] = "❌ تم التحويل خارج الاجتماع (رفض المضيف الطلب أو انتهت الحصة)"
+        result["details"] = f"الرابط الحالي: {page.url}"
+        return result
 
     # 1. Check if inside call
     if await is_in_call(page):
@@ -1815,8 +1904,12 @@ async def check_for_error_screen(page: Page) -> tuple[bool, str]:
         ('h1:has-text("الرجوع إلى الشاشة الرئيسية")', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
         ('text="Returning to home screen in"', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
         ('text="الرجوع إلى الشاشة الرئيسية خلال"', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
+        ('text="Someone in the call denied your request"', "رفض أحد المشاركين طلب انضمامك (المعلم رفض الدخول)"),
+        ('text="رفض أحد المشاركين طلب انضمامك"', "رفض أحد المشاركين طلب انضمامك (المعلم رفض الدخول)"),
         ('text="You can\'t join this video call"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
-        ('text="لا يُمكنك الانضمام إلى مكالمة الفيديو هذه"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه")
+        ('text="لا يُمكنك الانضمام إلى مكالمة الفيديو هذه"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
+        ('text="You cannot join this video call"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
+        ('text="لا يمكنك الانضمام إلى مكالمة الفيديو هذه"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه")
     ]
     for sel, desc in error_selectors:
         try:
@@ -1838,6 +1931,19 @@ async def wait_until_admitted(page: Page, timeout_seconds: int = 1800) -> bool:
 
         if await is_in_call(page):
             return True
+
+        # Check if redirected away from meeting room
+        curr_url = page.url.lower()
+        if "workspace.google.com" in curr_url or curr_url.rstrip("/").endswith("meet.google.com"):
+            record_task(
+                "المهمة 8: تم الخروج أو الرفض",
+                "error",
+                "❌ تم التحويل خارج الاجتماع (رفض المضيف الطلب أو انتهت الحصة)",
+                f"الرابط الحالي: {page.url}",
+                problem_type="DENIED_OR_ENDED"
+            )
+            logger.warning(f"Redirected away from meeting: {page.url}. Host denied or meeting ended.")
+            return False
 
         has_err, desc = await check_for_error_screen(page)
         if has_err:
@@ -2302,6 +2408,21 @@ async def run_single_meeting_flow(browser, target_url: str, student_name: str):
                 logger.info("Meeting stopped by user request.")
                 break
 
+            target_url = clean_meet_url(target_url)
+
+            # Recreate clean page on retries to discard dirty state or aborted scripts
+            if attempt > 1:
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                except Exception:
+                    pass
+                try:
+                    page = await context.new_page()
+                    current_page_ref = page
+                except Exception:
+                    pass
+
             # Check if page or context was closed, and recreate cleanly
             if page.is_closed():
                 logger.warning("Target page was closed. Recreating fresh context and page...")
@@ -2326,7 +2447,15 @@ async def run_single_meeting_flow(browser, target_url: str, student_name: str):
                     f"الهدف: {target_url}"
                 )
                 logger.info(f"Opening Meet URL (Attempt {attempt}/{max_attempts}): {target_url}")
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as goto_err:
+                    err_txt = str(goto_err).lower()
+                    if "err_aborted" in err_txt:
+                        logger.warning(f"page.goto reported net::ERR_ABORTED (handled - Meet redirect in progress): {goto_err}")
+                        await asyncio.sleep(2)
+                    else:
+                        raise goto_err
                 await asyncio.sleep(2)
 
                 bot_state["current_url"] = page.url
@@ -2554,7 +2683,7 @@ async def run_bot():
                 await new_meeting_event.wait()
                 new_meeting_event.clear()
 
-            target_url = MEET_URL
+            target_url = clean_meet_url(MEET_URL)
             target_student = STUDENT_NAME or "hazem"
             logger.info("=========================================")
             logger.info(f"  Starting Meeting: {target_url}")
