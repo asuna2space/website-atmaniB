@@ -2,3 +2,6 @@ playwright==1.49.1
 python-dotenv==1.0.1
 psutil==6.1.1
 httpx==0.28.1
+SpeechRecognition>=3.10.0
+pydub>=0.25.1
+imageio-ffmpeg>=0.5.1

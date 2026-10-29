@@ -389,12 +389,13 @@ async def main():
         print(" [4] 📋 لصق كود الكوكيز (JSON أو Base64) يدوياً هنا في Terminal")
         print(" [5] 🔍 فحص صلاحية ملف state.json الحالي والتأكد من اتصال الحساب")
         print(" [6] 🧹 حذف وتصفير جميع الكوكيز والجلسات السابقة (Clean Reset)")
+        print(" [7] 🤖 الأداة الآلية الجديدة: تسجيل الدخول الآلي عبر Firefox وإرسال Base64 لتيليجرام فوراً")
         print(" [0] خروج")
         print("-" * 65)
 
-        choice = input("👉 أدخل رقم الخيار [1/2/3/4/5/6/0] واضغط Enter (الافتراضي 1): ").strip()
+        choice = input("👉 أدخل رقم الخيار [1/2/3/4/5/6/7/0] واضغط Enter (الافتراضي 7): ").strip()
         if not choice:
-            choice = "1"
+            choice = "7"
 
         if choice == "1":
             if import_from_clipboard():
@@ -412,11 +413,18 @@ async def main():
             await verify_state_file()
         elif choice == "6":
             clean_all_cookies()
+        elif choice == "7":
+            firefox_tool = os.path.join(BASE_DIR, "firefox_cookie_tool.py")
+            if os.path.exists(firefox_tool):
+                subprocess.run([sys.executable, firefox_tool])
+                await verify_state_file()
+            else:
+                print("❌ تعذر العثور على أداة firefox_cookie_tool.py")
         elif choice == "0":
             print("\nتم الخروج بنجاح.")
             break
         else:
-            print("\n❌ خيار غير معروف، يرجى كتابة رقم من 0 إلى 6.")
+            print("\n❌ خيار غير معروف، يرجى كتابة رقم من 0 إلى 7.")
 
         input("\nاضغط ENTER للعودة إلى القائمة الرئيسية...")
 
