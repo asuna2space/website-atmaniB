@@ -1831,6 +1831,8 @@ async def diagnose_post_click_state(page: Page) -> dict:
         ("Sorry, we've encountered a problem", "عذراً، حدثت مشكلة", "DATACENTER_IP_BLOCKED", "حظر خوادم Render أو سقوط اتصال WebRTC"),
         ("Returning to home screen in", "الرجوع إلى الشاشة الرئيسية خلال", "DATACENTER_IP_BLOCKED", "جوجل أسقط الاتصال وبدأ العد التنازلي للرجوع للشاشة الرئيسية"),
         ("You can't join this video call", "لا يمكنك الانضمام إلى مكالمة الفيديو هذه", "HOST_SECURITY_RESTRICTED", "إعدادات الأمان لدى المعلم تمنع دخول غير المدعوين"),
+        ("You can't join this video call", "لا يُمكنك الانضمام إلى مكالمة الفيديو هذه", "HOST_SECURITY_RESTRICTED", "المعلم حصر الدخول على حسابات المدرسة (@hns-re2sd.dz) - جلسة الدخول منتهية"),
+        ("Your meeting is safe", "اجتماعك آمن", "HOST_SECURITY_RESTRICTED", "المعلم حصر الدخول على حسابات المدرسة (@hns-re2sd.dz) - جلسة الدخول منتهية"),
         ("Someone in the call denied your request", "رفض أحد المشاركين طلب انضمامك", "DENIED_BY_HOST", "المعلم ضغط على رفض دخولك"),
         ("This call is full", "الاجتماع ممتلئ", "CALL_FULL", "الاجتماع وصل للحد الأقصى للعدد المسموح"),
         ("Your meeting is not ready", "اجتماعك غير جاهز", "MEETING_NOT_READY", "الاجتماع لم يتم تفعيله بعد")
@@ -1898,18 +1900,21 @@ async def diagnose_post_click_state(page: Page) -> dict:
 async def check_for_error_screen(page: Page) -> tuple[bool, str]:
     """Checks if Google Meet displays an error or return-to-home screen and returns (has_error, error_text)."""
     error_selectors = [
-        ('text="Sorry, we\'ve encountered a problem"', "عذراً، حدثت مشكلة (سقوط اتصال WebRTC)"),
-        ('text="عذراً، حدثت مشكلة"', "عذراً، حدثت مشكلة (سقوط اتصال WebRTC)"),
+        (':has-text("Sorry, we\'ve encountered a problem")', "عذراً، حدثت مشكلة (سقوط اتصال WebRTC)"),
+        (':has-text("عذراً، حدثت مشكلة")', "عذراً، حدثت مشكلة (سقوط اتصال WebRTC)"),
         ('h1:has-text("Returning to home screen")', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
         ('h1:has-text("الرجوع إلى الشاشة الرئيسية")', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
-        ('text="Returning to home screen in"', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
-        ('text="الرجوع إلى الشاشة الرئيسية خلال"', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
-        ('text="Someone in the call denied your request"', "رفض أحد المشاركين طلب انضمامك (المعلم رفض الدخول)"),
-        ('text="رفض أحد المشاركين طلب انضمامك"', "رفض أحد المشاركين طلب انضمامك (المعلم رفض الدخول)"),
-        ('text="You can\'t join this video call"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
-        ('text="لا يُمكنك الانضمام إلى مكالمة الفيديو هذه"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
-        ('text="You cannot join this video call"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
-        ('text="لا يمكنك الانضمام إلى مكالمة الفيديو هذه"', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه")
+        (':has-text("Returning to home screen in")', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
+        (':has-text("الرجوع إلى الشاشة الرئيسية خلال")', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
+        (':has-text("العودة إلى الشاشة الرئيسية")', "الرجوع إلى الشاشة الرئيسية (سقوط الاتصال)"),
+        (':has-text("Someone in the call denied your request")', "رفض أحد المشاركين طلب انضمامك (المعلم رفض الدخول)"),
+        (':has-text("رفض أحد المشاركين طلب انضمامك")', "رفض أحد المشاركين طلب انضمامك (المعلم رفض الدخول)"),
+        (':has-text("You can\'t join this video call")', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
+        (':has-text("You cannot join this video call")', "لا يمكنك الانضمام إلى مكالمة الفيديو هذه"),
+        (':has-text("لا يُمكنك الانضمام")', "لا يمكنك الانضمام إلى مكالمة الفيديو (الاجتماع محصور لحساب المدرسة @hns-re2sd.dz فقط - الكوكيز منتهية)"),
+        (':has-text("لا يمكنك الانضمام")', "لا يمكنك الانضمام إلى مكالمة الفيديو (الاجتماع محصور لحساب المدرسة @hns-re2sd.dz فقط - الكوكيز منتهية)"),
+        (':has-text("اجتماعك آمن")', "اجتماعك آمن (الاجتماع محصور لحساب المدرسة @hns-re2sd.dz فقط - الكوكيز منتهية)"),
+        ('button:has-text("رجوع إلى الشاشة الرئيسية")', "تم حظر الدخول إلى الاجتماع (مطلوب حساب المدرسة)")
     ]
     for sel, desc in error_selectors:
         try:
